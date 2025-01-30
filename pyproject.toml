@@ -6,9 +6,15 @@ build-backend = "hatchling.build"
 [project]
 name = "kde"
 version = "0.1.0"
-dependencies = ["click", 
-                "pytest",
-                "pandas",
-                "numpy<2",
-                ]
+dependencies = [
+    "click",
+    "pytest",
+    "pandas",
+    "numpy<2",
+    "torch",
+    "faiss-gpu",
+    "scikit-learn",
+    "matplotlib",
+    "scipy",
+]
 requires-python = ">= 3.8"
