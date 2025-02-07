@@ -6,6 +6,7 @@ import numpy as np
 from sklearn.neighbors import KernelDensity
 import matplotlib.pyplot as plt
 import time
+import pickle
 
 percentile_re = re.compile(r'(?:\[(\d+),\s{0,1}(\d+)\],{0,1})')
 
@@ -165,6 +166,10 @@ def main():
 
     gpu_kde = kde.KNNKDE(k=15, bandwidth='scott', kernel="gaussian")
     gpu_kde.fit(id_input)
+    with open("gpu_kde.pkl", "wb") as f:
+        pickle.dump(gpu_kde, f)
+    with open("gpu_kde.pkl", "rb") as f:
+        gpu_kde = pickle.load(f)
     kde_sklearn = KernelDensity(bandwidth=0.2, kernel="gaussian", rtol=0.1)
     kde_sklearn.fit(id_input.cpu().numpy())
 
