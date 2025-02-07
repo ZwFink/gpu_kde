@@ -171,6 +171,7 @@ class KNNKDE:
         Args:
             X (torch.Tensor): Training data of shape [n_samples, n_features]
         """
+        X = X.to(torch.float32)
         self.scaler.fit(X)
         X_scaled = self.scaler.transform(X)
         
@@ -178,7 +179,10 @@ class KNNKDE:
         self._set_bandwidth(X)
 
         if self.gpu_available:
-            self.index = faiss.index_cpu_to_all_gpus(faiss.IndexFlatL2(X_scaled.shape[1]))
+            res = faiss.StandardGpuResources()
+            co = faiss.GpuClonerOptions()
+            co.useFloat16 = False   
+            self.index = faiss.index_cpu_to_gpu(res, 0, faiss.IndexFlatL2(X_scaled.shape[1]), co)
         else:
             self.index = faiss.IndexFlatL2(X_scaled.shape[1])
         self.index.add(X_scaled)
@@ -194,7 +198,23 @@ class KNNKDE:
             torch.Tensor: Estimated density values of shape [batch_size]
         """
         # x can now be [batch_size, features]
+        x = x.to(torch.float32)
         x = self.scaler.transform(x)
         D, I, R = self.index.search_and_reconstruct(x, k=self.k)
         kernel_values = _gaussian_kernel(x, R, self.bandwidth)
         return torch.mean(kernel_values, dim=1)  # Average over k neighbors for each sample
+
+    # we need to save the index to the CPU
+    # so we can be serialized
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # check if the index is on the gpu
+        state['index'] = faiss.serialize_index(faiss.index_gpu_to_cpu(self.index))
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        res = faiss.StandardGpuResources()
+        co = faiss.GpuClonerOptions()
+        co.useFloat16 = False
+        self.index = faiss.index_cpu_to_gpu(res, 0, faiss.deserialize_index(self.index), co)
