@@ -49,6 +49,15 @@ def _scaler_transform(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) ->
     """
     return (x - mean) / std
 
+class IdentityScaler:
+    def fit(self, X):
+        pass
+
+    def transform(self, X):
+        return X
+    
+
+
 class StandardScaler:
     """Standardize features by removing the mean and scaling to unit variance.
     
@@ -84,7 +93,7 @@ class KNNKDE:
     """
     K-Nearest Neighbors Kernel Density Estimation.
     Uses FAISS for efficient nearest neighbor search.
-    L2 distance is used for the distance metric.
+    Supports IndexFlatL2 and IndexIVFScalarQuantizer.
 
     Parameters:
         k: int, number of neighbors
@@ -93,16 +102,25 @@ class KNNKDE:
             If 'scott': uses Scott's rule with dimension correction
             If torch.Tensor: uses different bandwidth for each dimension
         kernel: str, kernel type (only 'gaussian' supported)
+        index_type: str, 'flat' or 'ivf_sq'. Default 'flat'.
+        nlist: int, number of Voronoi cells for IVF index. Default 100.
+        nprobe: int, number of cells to search for IVF index. Default 1.
     """
-    def __init__(self, k=5, bandwidth=1.0, kernel="gaussian"):
+    def __init__(self, k=5, bandwidth=1.0, kernel="gaussian", index_type="ivf_sq", nlist=1000, nprobe=1):
         self.k = k
-        self.bandwidth_spec = bandwidth  # Store the specification
-        self.bandwidth = None  # Will be set during fit
+        self.bandwidth_spec = bandwidth
+        self.bandwidth = None
         assert kernel.lower() == "gaussian", "Only Gaussian kernel is supported"
         self.kernel = kernel
+        self.index_type = index_type.lower()
+        assert self.index_type in ['flat', 'ivf_sq'], "index_type must be 'flat' or 'ivf_sq'"
+        self.nlist = nlist
+        self.nprobe = nprobe
         self.index = None
         self.gpu_available = faiss.get_num_gpus() > 0
         self.scaler = StandardScaler()
+        self._X_scaled_stored = None # To store scaled data for reconstruction workaround
+        self._X_device = None # Store device of original data
 
     def _compute_scott_bandwidth(self, n_samples: int, n_features: int, std: torch.Tensor) -> torch.Tensor:
         """Compute Scott's rule bandwidth with high-dimensional correction.
@@ -166,55 +184,197 @@ class KNNKDE:
         This method:
         1. Fits the standard scaler
         2. Sets the bandwidth
-        3. Builds the FAISS index for efficient nearest neighbor search
-
-        Args:
-            X (torch.Tensor): Training data of shape [n_samples, n_features]
+        3. Builds and trains (if necessary) the FAISS index
+        4. Adds the data to the index
+        5. Stores the scaled data for manual reconstruction workaround.
         """
         X = X.to(torch.float32)
+        self._X_device = X.device # Store the original device
         self.scaler.fit(X)
         X_scaled = self.scaler.transform(X)
-        
+        n_samples, n_features = X_scaled.shape
+
         # Set bandwidth based on specification
         self._set_bandwidth(X)
 
+        # Create CPU index first
+        if self.index_type == 'flat':
+            cpu_index = faiss.IndexFlatL2(n_features)
+        elif self.index_type == 'ivf_sq':
+            quantizer = faiss.IndexFlatL2(n_features)
+            # Using QT_8bit for potentially better stability with useFloat16=False on GPU
+            cpu_index = faiss.IndexIVFScalarQuantizer(quantizer, n_features, self.nlist, faiss.ScalarQuantizer.QT_8bit)
+            print(f"Training IVF index with {n_samples} vectors...")
+            X_scaled_cpu = X_scaled.cpu()
+            cpu_index.train(X_scaled_cpu)
+            del X_scaled_cpu
+            print("Training complete.")
+            assert cpu_index.is_trained
+
+        # Handle GPU transfer and add data
         if self.gpu_available:
+            print("Moving index to GPU...")
             res = faiss.StandardGpuResources()
             co = faiss.GpuClonerOptions()
-            co.useFloat16 = False   
-            self.index = faiss.index_cpu_to_gpu(res, 0, faiss.IndexFlatL2(X_scaled.shape[1]), co)
+            co.useFloat16 = False # Matches QT_8bit usage well
+            self.index = faiss.index_cpu_to_gpu(res, 0, cpu_index, co)
+            print("Adding data to GPU index...")
+            self.index.add(X_scaled)
+            print("Data added.")
+            # Store scaled data on the same device as the index (GPU)
+            print("Storing scaled data on GPU for reconstruction workaround...")
+            self._X_scaled_stored = X_scaled.clone() # Store on GPU
         else:
-            self.index = faiss.IndexFlatL2(X_scaled.shape[1])
-        self.index.add(X_scaled)
+            self.index = cpu_index
+            print("Adding data to CPU index...")
+            self.index.add(X_scaled)
+            print("Data added.")
+            # Store scaled data on the same device as the index (CPU)
+            print("Storing scaled data on CPU for reconstruction workaround...")
+            self._X_scaled_stored = X_scaled.cpu().clone() # Store on CPU
 
-    
-    def kernel_density(self, x):
-        """Estimate the probability density at the given points.
+        print("Fit complete.")
 
-        Args:
-            x (torch.Tensor): Points to estimate density at, shape [batch_size, features]
 
-        Returns:
-            torch.Tensor: Estimated density values of shape [batch_size]
+    def kernel_density(self, x, batch_size=32768):
+        """Estimate the probability density at the given points, processing in batches.
+        Uses manual reconstruction workaround if index is IVF_SQ.
         """
-        # x can now be [batch_size, features]
-        x = x.to(torch.float32)
-        x = self.scaler.transform(x)
-        D, I, R = self.index.search_and_reconstruct(x, k=self.k)
-        kernel_values = _gaussian_kernel(x, R, self.bandwidth)
-        return torch.mean(kernel_values, dim=1)  # Average over k neighbors for each sample
+        n_samples = x.shape[0]
+        if n_samples == 0:
+            return torch.empty(0, device=x.device)
 
-    # we need to save the index to the CPU
-    # so we can be serialized
+        assert self._X_scaled_stored is not None, "Model must be fit before calling kernel_density"
+        # Ensure input x is on the same device as the original training data was
+        x = x.to(self._X_device)
+
+        assert not torch.isnan(x).any(), "Input 'x' contains NaNs"
+        assert not torch.isinf(x).any(), "Input 'x' contains Infs"
+        # print("Input data validated (no NaNs/Infs).") # Optional: remove verbose prints
+
+        results = []
+
+        if self.index_type == 'ivf_sq':
+            # print(f"Setting nprobe to {self.nprobe} for IVF index...") # Optional print
+            if hasattr(self.index, 'nprobe'):
+                 self.index.nprobe = self.nprobe
+            elif hasattr(faiss, 'GpuParameterSpace'):
+                 params = faiss.GpuParameterSpace()
+                 params.set_index_parameter(self.index, 'nprobe', self.nprobe)
+
+        # print(f"Starting kernel density estimation with batch_size={batch_size}") # Optional print
+        for i in range(0, n_samples, batch_size):
+            batch_start_index = i
+            batch_end_index = min(i + batch_size, n_samples)
+            # print(f"\n--- Processing batch ...") # Optional print
+
+            x_batch = x[batch_start_index : batch_end_index].to(torch.float32)
+
+            # print(f"Batch ...: Scaling...") # Optional print
+            x_batch_scaled = self.scaler.transform(x_batch)
+
+            # --- WORKAROUND IMPLEMENTATION ---
+            # print(f"Batch ...: Searching (k={self.k})...") # Optional print
+            D_batch, I_batch = self.index.search(x_batch_scaled, k=self.k)
+            # print(f"Batch ...: Search complete.") # Optional print
+
+            # Manually fetch neighbors using indices I_batch from stored data
+            # print(f"Batch ...: Manually reconstructing neighbors...") # Optional print
+            # I_batch contains indices, shape [batch_size, k]
+            # Need to handle potential -1 indices if k > number of points in index (shouldn't happen here)
+            I_batch_flat = I_batch.view(-1)
+            # Ensure indices are valid before fetching
+            valid_indices = I_batch_flat[I_batch_flat != -1]
+            # Fetch corresponding vectors from stored data
+            # Ensure _X_scaled_stored is on the correct device (should match index device)
+            neighbors_flat = self._X_scaled_stored[valid_indices]
+            # Reshape back to [batch_size, k, features]
+            # We need to handle the -1s if they occurred, perhaps by filling with zeros?
+            # For simplicity, assuming k is small enough / index large enough that I_batch != -1
+            # If I_batch can contain -1, more careful handling is needed here.
+            R_batch = neighbors_flat.view(x_batch_scaled.shape[0], self.k, -1)
+            # print(f"Batch ...: Manual reconstruction complete.") # Optional print
+            # --- END WORKAROUND ---
+
+            # print(f"Batch ...: Calculating kernel values...") # Optional print
+            kernel_values_batch = _gaussian_kernel(x_batch_scaled, R_batch, self.bandwidth)
+
+            # print(f"Batch ...: Calculating mean density...") # Optional print
+            batch_density = torch.mean(kernel_values_batch, dim=1)
+            # print(f"Batch ...: Appending results...") # Optional print
+            results.append(batch_density)
+
+        # print("\n--- Batch processing finished ---") # Optional print
+        # print("Concatenating results...") # Optional print
+        final_density = torch.cat(results, dim=0)
+        # print("Concatenation complete.") # Optional print
+
+        return final_density
+
     def __getstate__(self):
+        """Prepare the object state for serialization. Moves index to CPU if needed."""
         state = self.__dict__.copy()
-        # check if the index is on the gpu
-        state['index'] = faiss.serialize_index(faiss.index_gpu_to_cpu(self.index))
+        # Serialize index
+        index_to_serialize = self.index
+        if hasattr(faiss, 'GpuIndex') and isinstance(self.index, faiss.GpuIndex):
+             print("Moving index to CPU for serialization...")
+             index_to_serialize = faiss.index_gpu_to_cpu(self.index)
+        print("Serializing index...")
+        state['index'] = faiss.serialize_index(index_to_serialize)
+
+        # Handle _X_scaled_stored (move to CPU before saving)
+        if state['_X_scaled_stored'] is not None:
+            print("Moving stored scaled data to CPU for serialization...")
+            state['_X_scaled_stored'] = state['_X_scaled_stored'].cpu()
+
+        print("Serialization complete.")
         return state
 
     def __setstate__(self, state):
+        """Restore the object state from serialized data. Moves index and stored data to GPU if available."""
+        print("Deserializing index...")
+        index_bytes = state.pop('index')
+        X_scaled_stored_cpu = state.pop('_X_scaled_stored', None) # Pop stored data
+
+        # Restore the rest of the attributes first
         self.__dict__.update(state)
-        res = faiss.StandardGpuResources()
-        co = faiss.GpuClonerOptions()
-        co.useFloat16 = False
-        self.index = faiss.index_cpu_to_gpu(res, 0, faiss.deserialize_index(self.index), co)
+
+        # Deserialize index to CPU first
+        cpu_index = faiss.deserialize_index(index_bytes)
+        print("Index deserialization complete.")
+
+        # Restore stored data and move to appropriate device
+        if X_scaled_stored_cpu is not None:
+            print("Restoring scaled data...")
+            if self.gpu_available:
+                print("Moving stored scaled data to GPU...")
+                self._X_scaled_stored = X_scaled_stored_cpu.to(self._X_device) # Use stored device info
+            else:
+                print("Keeping stored scaled data on CPU...")
+                self._X_scaled_stored = X_scaled_stored_cpu
+            print("Stored scaled data restored.")
+        else:
+            self._X_scaled_stored = None
+
+
+        # Move index to GPU if applicable
+        if self.gpu_available:
+            print("Moving deserialized index to GPU...")
+            res = faiss.StandardGpuResources()
+            co = faiss.GpuClonerOptions()
+            co.useFloat16 = False # Consistent with fit
+            self.index = faiss.index_cpu_to_gpu(res, 0, cpu_index, co)
+            print("Index moved to GPU.")
+        else:
+            self.index = cpu_index
+            print("Index kept on CPU.")
+
+        # Set nprobe for IVF index after loading
+        if self.index_type == 'ivf_sq':
+             if hasattr(self.index, 'nprobe'):
+                 self.index.nprobe = self.nprobe
+             elif hasattr(faiss, 'GpuParameterSpace'):
+                 params = faiss.GpuParameterSpace()
+                 params.set_index_parameter(self.index, 'nprobe', self.nprobe)
+
+        print("State restoration complete.")
