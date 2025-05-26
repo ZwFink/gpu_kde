@@ -204,37 +204,23 @@ class KNNKDE:
             quantizer = faiss.IndexFlatL2(n_features)
             # Using QT_8bit for potentially better stability with useFloat16=False on GPU
             cpu_index = faiss.IndexIVFScalarQuantizer(quantizer, n_features, self.nlist, faiss.ScalarQuantizer.QT_8bit)
-            print(f"Training IVF index with {n_samples} vectors...")
             X_scaled_cpu = X_scaled.cpu()
             cpu_index.train(X_scaled_cpu)
             del X_scaled_cpu
-            print("Training complete.")
             assert cpu_index.is_trained
 
         # Handle GPU transfer and add data
         if self.gpu_available:
-            print("Moving index to GPU...")
             res = faiss.StandardGpuResources()
             co = faiss.GpuClonerOptions()
             co.useFloat16 = False # Matches QT_8bit usage well
             self.index = faiss.index_cpu_to_gpu(res, 0, cpu_index, co)
-            print("Adding data to GPU index...")
             self.index.add(X_scaled)
-            print("Data added.")
-            # Store scaled data on the same device as the index (GPU)
-            print("Storing scaled data on GPU for reconstruction workaround...")
             self._X_scaled_stored = X_scaled.clone() # Store on GPU
         else:
             self.index = cpu_index
-            print("Adding data to CPU index...")
             self.index.add(X_scaled)
-            print("Data added.")
-            # Store scaled data on the same device as the index (CPU)
-            print("Storing scaled data on CPU for reconstruction workaround...")
             self._X_scaled_stored = X_scaled.cpu().clone() # Store on CPU
-
-        print("Fit complete.")
-
 
     def kernel_density(self, x, batch_size=32768):
         """Estimate the probability density at the given points, processing in batches.
@@ -250,23 +236,19 @@ class KNNKDE:
 
         assert not torch.isnan(x).any(), "Input 'x' contains NaNs"
         assert not torch.isinf(x).any(), "Input 'x' contains Infs"
-        # print("Input data validated (no NaNs/Infs).") # Optional: remove verbose prints
 
         results = []
 
         if self.index_type == 'ivf_sq':
-            # print(f"Setting nprobe to {self.nprobe} for IVF index...") # Optional print
             if hasattr(self.index, 'nprobe'):
                  self.index.nprobe = self.nprobe
             elif hasattr(faiss, 'GpuParameterSpace'):
                  params = faiss.GpuParameterSpace()
                  params.set_index_parameter(self.index, 'nprobe', self.nprobe)
 
-        # print(f"Starting kernel density estimation with batch_size={batch_size}") # Optional print
         for i in range(0, n_samples, batch_size):
             batch_start_index = i
             batch_end_index = min(i + batch_size, n_samples)
-            # print(f"\n--- Processing batch ...") # Optional print
 
             x_batch = x[batch_start_index : batch_end_index].to(torch.float32)
 
@@ -299,22 +281,17 @@ class KNNKDE:
         # Serialize index
         index_to_serialize = self.index
         if hasattr(faiss, 'GpuIndex') and isinstance(self.index, faiss.GpuIndex):
-             print("Moving index to CPU for serialization...")
              index_to_serialize = faiss.index_gpu_to_cpu(self.index)
-        print("Serializing index...")
         state['index'] = faiss.serialize_index(index_to_serialize)
 
         # Handle _X_scaled_stored (move to CPU before saving)
         if state['_X_scaled_stored'] is not None:
-            print("Moving stored scaled data to CPU for serialization...")
             state['_X_scaled_stored'] = state['_X_scaled_stored'].cpu()
 
-        print("Serialization complete.")
         return state
 
     def __setstate__(self, state):
         """Restore the object state from serialized data. Moves index and stored data to GPU if available."""
-        print("Deserializing index...")
         index_bytes = state.pop('index')
         X_scaled_stored_cpu = state.pop('_X_scaled_stored', None) # Pop stored data
 
@@ -323,33 +300,24 @@ class KNNKDE:
 
         # Deserialize index to CPU first
         cpu_index = faiss.deserialize_index(index_bytes)
-        print("Index deserialization complete.")
 
         # Restore stored data and move to appropriate device
         if X_scaled_stored_cpu is not None:
-            print("Restoring scaled data...")
             if self.gpu_available:
-                print("Moving stored scaled data to GPU...")
                 self._X_scaled_stored = X_scaled_stored_cpu.to(self._X_device) # Use stored device info
             else:
-                print("Keeping stored scaled data on CPU...")
                 self._X_scaled_stored = X_scaled_stored_cpu
-            print("Stored scaled data restored.")
         else:
             self._X_scaled_stored = None
 
-
         # Move index to GPU if applicable
         if self.gpu_available:
-            print("Moving deserialized index to GPU...")
             res = faiss.StandardGpuResources()
             co = faiss.GpuClonerOptions()
             co.useFloat16 = False # Consistent with fit
             self.index = faiss.index_cpu_to_gpu(res, 0, cpu_index, co)
-            print("Index moved to GPU.")
         else:
             self.index = cpu_index
-            print("Index kept on CPU.")
 
         # Set nprobe for IVF index after loading
         if self.index_type == 'ivf_sq':
@@ -358,5 +326,3 @@ class KNNKDE:
              elif hasattr(faiss, 'GpuParameterSpace'):
                  params = faiss.GpuParameterSpace()
                  params.set_index_parameter(self.index, 'nprobe', self.nprobe)
-
-        print("State restoration complete.")
