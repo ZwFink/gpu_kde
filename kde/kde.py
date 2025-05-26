@@ -270,44 +270,26 @@ class KNNKDE:
 
             x_batch = x[batch_start_index : batch_end_index].to(torch.float32)
 
-            # print(f"Batch ...: Scaling...") # Optional print
             x_batch_scaled = self.scaler.transform(x_batch)
 
-            # --- WORKAROUND IMPLEMENTATION ---
-            # print(f"Batch ...: Searching (k={self.k})...") # Optional print
             D_batch, I_batch = self.index.search(x_batch_scaled, k=self.k)
-            # print(f"Batch ...: Search complete.") # Optional print
 
-            # Manually fetch neighbors using indices I_batch from stored data
-            # print(f"Batch ...: Manually reconstructing neighbors...") # Optional print
-            # I_batch contains indices, shape [batch_size, k]
-            # Need to handle potential -1 indices if k > number of points in index (shouldn't happen here)
-            I_batch_flat = I_batch.view(-1)
-            # Ensure indices are valid before fetching
-            valid_indices = I_batch_flat[I_batch_flat != -1]
-            # Fetch corresponding vectors from stored data
-            # Ensure _X_scaled_stored is on the correct device (should match index device)
-            neighbors_flat = self._X_scaled_stored[valid_indices]
-            # Reshape back to [batch_size, k, features]
-            # We need to handle the -1s if they occurred, perhaps by filling with zeros?
-            # For simplicity, assuming k is small enough / index large enough that I_batch != -1
-            # If I_batch can contain -1, more careful handling is needed here.
-            R_batch = neighbors_flat.view(x_batch_scaled.shape[0], self.k, -1)
-            # print(f"Batch ...: Manual reconstruction complete.") # Optional print
-            # --- END WORKAROUND ---
+            I_clamped = I_batch.clone().clamp(min=0)
+            batch_size_cur = x_batch_scaled.shape[0]
+            I_flat = I_clamped.view(-1)
+            R_flat = self._X_scaled_stored[I_flat]
+            R_batch = R_flat.view(batch_size_cur, self.k, -1)
 
-            # print(f"Batch ...: Calculating kernel values...") # Optional print
             kernel_values_batch = _gaussian_kernel(x_batch_scaled, R_batch, self.bandwidth)
 
-            # print(f"Batch ...: Calculating mean density...") # Optional print
-            batch_density = torch.mean(kernel_values_batch, dim=1)
-            # print(f"Batch ...: Appending results...") # Optional print
+            # Replace mean density with sum over valid neighbors divided by count
+            mask = (I_batch != -1).to(kernel_values_batch.dtype)
+            sum_kernel = (kernel_values_batch * mask).sum(dim=1)
+            valid_counts = mask.sum(dim=1).clamp(min=1)
+            batch_density = sum_kernel / valid_counts
             results.append(batch_density)
 
-        # print("\n--- Batch processing finished ---") # Optional print
-        # print("Concatenating results...") # Optional print
         final_density = torch.cat(results, dim=0)
-        # print("Concatenation complete.") # Optional print
 
         return final_density
 
