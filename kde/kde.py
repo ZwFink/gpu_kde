@@ -217,10 +217,23 @@ class KNNKDE:
             self.index = faiss.index_cpu_to_gpu(res, 0, cpu_index, co)
             self.index.add(X_scaled)
             self._X_scaled_stored = X_scaled.clone() # Store on GPU
+            self._gpu_mem_use = res.getMemoryInfo()
         else:
             self.index = cpu_index
             self.index.add(X_scaled)
             self._X_scaled_stored = X_scaled.cpu().clone() # Store on CPU
+
+    def get_gpu_memory_use_mb(self):
+        if self.gpu_available:
+            mem_use_copy = self._gpu_mem_use.copy()[0]
+            try:
+                del mem_use_copy['TemporaryMemoryBuffer']
+            except KeyError:
+                pass
+            finally:
+                return (sum(map(lambda x: x[1], mem_use_copy.values()))) / (1024 * 1024)
+        else:
+            return 0
 
     def kernel_density(self, x, batch_size=32768):
         """Estimate the probability density at the given points, processing in batches.
